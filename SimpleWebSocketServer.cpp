@@ -171,34 +171,35 @@ void SimpleWebSocketServer::closeConnectionInternal(const String& id, int code, 
 
 void SimpleWebSocketServer::initServer()
 {
-	ScopedLock lock(serverLock);
-
 	try
 	{
-		ioService = std::make_shared<asio::io_service>();
-		http.reset(new HttpServer());
-		http->config.port = port;
-		http->io_service = ioService;
+		{
+			ScopedLock lock(serverLock);
 
-		http->default_resource["GET"] = std::bind(&SimpleWebSocketServer::httpDefaultCallback, this, std::placeholders::_1, std::placeholders::_2);
-		http->on_upgrade = std::bind(&SimpleWebSocketServer::onHTTPUpgrade, this, std::placeholders::_1, std::placeholders::_2);
+			ioService = std::make_shared<asio::io_service>();
+			http.reset(new HttpServer());
+			http->config.port = port;
+			http->io_service = ioService;
 
-	//WebSocket init
-		ws.reset(new WsServer());
-		auto& wsEndpoint = ws->endpoint[("^" + wsSuffix + "/?$").toStdString()];
+			http->default_resource["GET"] = std::bind(&SimpleWebSocketServer::httpDefaultCallback, this, std::placeholders::_1, std::placeholders::_2);
+			http->on_upgrade = std::bind(&SimpleWebSocketServer::onHTTPUpgrade, this, std::placeholders::_1, std::placeholders::_2);
 
-		wsEndpoint.on_message = std::bind(&SimpleWebSocketServer::onMessageCallback, this, std::placeholders::_1, std::placeholders::_2);
-		wsEndpoint.on_error = std::bind(&SimpleWebSocketServer::onErrorCallback, this, std::placeholders::_1, std::placeholders::_2);
-		wsEndpoint.on_open = std::bind(&SimpleWebSocketServer::onNewConnectionCallback, this, std::placeholders::_1);
-		wsEndpoint.on_close = std::bind(&SimpleWebSocketServer::onConnectionCloseCallback, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
+			//WebSocket init
+			ws.reset(new WsServer());
+			auto& wsEndpoint = ws->endpoint[("^" + wsSuffix + "/?$").toStdString()];
+
+			wsEndpoint.on_message = std::bind(&SimpleWebSocketServer::onMessageCallback, this, std::placeholders::_1, std::placeholders::_2);
+			wsEndpoint.on_error = std::bind(&SimpleWebSocketServer::onErrorCallback, this, std::placeholders::_1, std::placeholders::_2);
+			wsEndpoint.on_open = std::bind(&SimpleWebSocketServer::onNewConnectionCallback, this, std::placeholders::_1);
+			wsEndpoint.on_close = std::bind(&SimpleWebSocketServer::onConnectionCloseCallback, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
 
 
-		http->config.timeout_request = 1;
-		http->config.timeout_content = 2;
-		http->config.max_request_streambuf_size = 1000000;
-		http->config.thread_pool_size = 2;
-		http->start(std::bind(&SimpleWebSocketServer::httpStartCallback, this, std::placeholders::_1));
-		
+			http->config.timeout_request = 1;
+			http->config.timeout_content = 2;
+			http->config.max_request_streambuf_size = 1000000;
+			http->config.thread_pool_size = 2;
+			http->start(std::bind(&SimpleWebSocketServer::httpStartCallback, this, std::placeholders::_1));
+		}
 
 		if (ioService != nullptr) ioService->run();
 	}catch(std::exception e)
@@ -472,37 +473,39 @@ void SecureWebSocketServer::closeConnectionInternal(const String& id, int code, 
 
 void SecureWebSocketServer::initServer()
 {
-
-	ScopedLock lock(serverLock);
-	
 	try
 	{
-		ioService = std::make_shared<asio::io_service>();
-		
-		http.reset(new HttpsServer(certFile.toStdString(), keyFile.toStdString(), verifyFile.toStdString()));
-		http->config.port = port;
-		http->io_service = ioService;
+		{
+			ScopedLock lock(serverLock);
 
-		http->default_resource["GET"] = std::bind(&SecureWebSocketServer::httpDefaultCallback, this, std::placeholders::_1, std::placeholders::_2);
-		http->on_upgrade = std::bind(&SecureWebSocketServer::onHTTPUpgrade, this, std::placeholders::_1, std::placeholders::_2);
+			ioService = std::make_shared<asio::io_service>();
 
-        //WebSocket init
-		ws.reset(new WssServer(certFile.toStdString(), keyFile.toStdString(), verifyFile.toStdString()));
-        //ws->config.timeout_idle = 1;
-		ws->config.timeout_request = 2;
+			http.reset(new HttpsServer(certFile.toStdString(), keyFile.toStdString(), verifyFile.toStdString()));
+			http->config.port = port;
+			http->io_service = ioService;
 
-		auto& wsEndpoint = ws->endpoint[("^" + wsSuffix + "/?$").toStdString()];
+			http->default_resource["GET"] = std::bind(&SecureWebSocketServer::httpDefaultCallback, this, std::placeholders::_1, std::placeholders::_2);
+			http->on_upgrade = std::bind(&SecureWebSocketServer::onHTTPUpgrade, this, std::placeholders::_1, std::placeholders::_2);
 
-		wsEndpoint.on_message = std::bind(&SecureWebSocketServer::onMessageCallback, this, std::placeholders::_1, std::placeholders::_2);
-		wsEndpoint.on_error = std::bind(&SecureWebSocketServer::onErrorCallback, this, std::placeholders::_1, std::placeholders::_2);
-		wsEndpoint.on_open = std::bind(&SecureWebSocketServer::onNewConnectionCallback, this, std::placeholders::_1);
-		wsEndpoint.on_close = std::bind(&SecureWebSocketServer::onConnectionCloseCallback, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
+			//WebSocket init
+			ws.reset(new WssServer(certFile.toStdString(), keyFile.toStdString(), verifyFile.toStdString()));
+			//ws->config.timeout_idle = 1;
+			ws->config.timeout_request = 2;
 
-		http->config.timeout_request = 1;
-		http->config.timeout_content = 2;
-		http->config.max_request_streambuf_size = 1000000;
-		http->config.thread_pool_size = 2;
-		http->start(std::bind(&SecureWebSocketServer::httpStartCallback, this, std::placeholders::_1));
+			auto& wsEndpoint = ws->endpoint[("^" + wsSuffix + "/?$").toStdString()];
+
+			wsEndpoint.on_message = std::bind(&SecureWebSocketServer::onMessageCallback, this, std::placeholders::_1, std::placeholders::_2);
+			wsEndpoint.on_error = std::bind(&SecureWebSocketServer::onErrorCallback, this, std::placeholders::_1, std::placeholders::_2);
+			wsEndpoint.on_open = std::bind(&SecureWebSocketServer::onNewConnectionCallback, this, std::placeholders::_1);
+			wsEndpoint.on_close = std::bind(&SecureWebSocketServer::onConnectionCloseCallback, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
+
+			http->config.timeout_request = 1;
+			http->config.timeout_content = 2;
+			http->config.max_request_streambuf_size = 1000000;
+			http->config.thread_pool_size = 2;
+			http->start(std::bind(&SecureWebSocketServer::httpStartCallback, this, std::placeholders::_1));
+		}
+
 		if (ioService != nullptr) ioService->run();
 
 	}catch(std::exception e)
