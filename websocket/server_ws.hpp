@@ -327,6 +327,23 @@ namespace SimpleWeb {
 
         *send_stream << reason;
 
+        // A close frame must not be followed by a stale replaceable data frame.
+        // Keep the item currently in flight and any already-queued reliable messages,
+        // but discard pending latest-only data before enqueueing the close.
+        {
+          LockGuard lock(send_queue_mutex);
+          if(!send_queue.empty()) {
+            auto it = send_queue.begin();
+            ++it;
+            while(it != send_queue.end()) {
+              if(it->replaceable)
+                it = send_queue.erase(it);
+              else
+                ++it;
+            }
+          }
+        }
+
         // fin_rsv_opcode=136: message close
         send(std::move(send_stream), std::move(callback), 136);
       }
