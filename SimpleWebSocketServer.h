@@ -46,8 +46,13 @@ public:
 	void send(const juce::MemoryBlock& data);
 	virtual void sendTo(const juce::String& message, const juce::String& id) {}
 	virtual void sendTo(const juce::MemoryBlock& data, const juce::String& id) {}
+
+	/// Send replaceable real-time data to one client. If the socket is slower than
+	/// the producer, only the newest pending latest-only message is retained.
+	/// Regular send/sendTo messages remain reliable and ordered.
 	virtual void sendLatestTo(const juce::String& message, const juce::String& id) {}
 	virtual void sendLatestTo(const juce::MemoryBlock& data, const juce::String& id) {}
+
 	virtual void sendExclude(const juce::String& message, const juce::StringArray excludeIds) {}
 	virtual void sendExclude(const juce::MemoryBlock& data, const juce::StringArray excludeIds) {}
 
