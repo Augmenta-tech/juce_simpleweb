@@ -232,21 +232,21 @@ namespace SimpleWeb {
 
         LockGuard lock(send_queue_mutex);
 
-        // Reliable messages must not be delayed behind a stale replaceable frame.
-        // The first queue item is already in flight and cannot be reordered.
-        auto insert_pos = send_queue.end();
+        // Queue invariant: the first item may already be in flight, followed by
+        // reliable messages and at most one replaceable real-time message.
+        // A reliable message makes any older pending real-time snapshot stale.
         if(!send_queue.empty()) {
           auto it = send_queue.begin();
           ++it;
-          for(; it != send_queue.end(); ++it) {
-            if(it->replaceable) {
-              insert_pos = it;
-              break;
-            }
+          while(it != send_queue.end()) {
+            if(it->replaceable)
+              it = send_queue.erase(it);
+            else
+              ++it;
           }
         }
 
-        send_queue.emplace(insert_pos, std::move(out_header), std::move(out_message), std::move(callback), false);
+        send_queue.emplace_back(std::move(out_header), std::move(out_message), std::move(callback), false);
         if(send_queue.size() == 1)
           send_from_queue();
       }
@@ -326,23 +326,6 @@ namespace SimpleWeb {
         send_stream->put(status % 256);
 
         *send_stream << reason;
-
-        // A close frame must not be followed by a stale replaceable data frame.
-        // Keep the item currently in flight and any already-queued reliable messages,
-        // but discard pending latest-only data before enqueueing the close.
-        {
-          LockGuard lock(send_queue_mutex);
-          if(!send_queue.empty()) {
-            auto it = send_queue.begin();
-            ++it;
-            while(it != send_queue.end()) {
-              if(it->replaceable)
-                it = send_queue.erase(it);
-              else
-                ++it;
-            }
-          }
-        }
 
         // fin_rsv_opcode=136: message close
         send(std::move(send_stream), std::move(callback), 136);
