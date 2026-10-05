@@ -129,6 +129,32 @@ void SimpleWebSocketServer::sendTo(const MemoryBlock& data, const String& id)
 	}
 }
 
+void SimpleWebSocketServer::sendLatestTo(const String& message, const String& id)
+{
+	if (connectionMap.contains(id))
+	{
+		connectionMap[id]->send_latest(message.toStdString());
+	}
+	else
+	{
+		DBG("Websocket connection not found : " << id);
+	}
+}
+
+void SimpleWebSocketServer::sendLatestTo(const MemoryBlock& data, const String& id)
+{
+	std::shared_ptr<WsServer::OutMessage> out_message = std::make_shared<WsServer::OutMessage>();
+	out_message->write((const char*) data.getData(), data.getSize());
+	if (connectionMap.contains(id))
+	{
+		connectionMap[id]->send_latest(out_message, 130); // 130 = binary
+	}
+	else
+	{
+		DBG("Websocket connection not found : " << id);
+	}
+}
+
 void SimpleWebSocketServer::sendExclude(const String& message, const StringArray excludeIds)
 {
 	HashMap<String, std::shared_ptr<WsServer::Connection>, DefaultHashFunctions, CriticalSection>::Iterator it(connectionMap);
@@ -482,6 +508,32 @@ void SecureWebSocketServer::sendTo(const MemoryBlock& data, const String& id)
 	if (connectionMap.contains(id))
 	{
 		connectionMap[id]->send(out_message, nullptr, 130); // 130 = binary
+	}
+	else
+	{
+		DBG("[Dashboard] Websocket connection not found : " << id);
+	}
+}
+
+void SecureWebSocketServer::sendLatestTo(const String& message, const String& id)
+{
+	if (connectionMap.contains(id))
+	{
+		connectionMap[id]->send_latest(message.toStdString());
+	}
+	else
+	{
+		DBG("[Dashboard] Websocket connection not found : " << id);
+	}
+}
+
+void SecureWebSocketServer::sendLatestTo(const MemoryBlock& data, const String& id)
+{
+	std::shared_ptr<WssServer::OutMessage> out_message = std::make_shared<WssServer::OutMessage>();
+	out_message->write((const char*) data.getData(), data.getSize());
+	if (connectionMap.contains(id))
+	{
+		connectionMap[id]->send_latest(out_message, 130); // 130 = binary
 	}
 	else
 	{
