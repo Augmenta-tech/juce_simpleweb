@@ -253,6 +253,7 @@ namespace SimpleWeb {
 
       /// Queue a replaceable real-time message.
       /// At most one replaceable message is kept pending behind the item currently in flight.
+      /// All send_latest calls on this connection share that one replaceable slot.
       /// Newer replaceable data supersedes older pending replaceable data, while reliable
       /// messages retain their order and are always sent first.
       void send_latest(std::shared_ptr<OutMessage> out_message, unsigned char fin_rsv_opcode = 129) {
