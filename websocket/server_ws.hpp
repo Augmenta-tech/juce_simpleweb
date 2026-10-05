@@ -152,11 +152,12 @@ namespace SimpleWeb {
       class OutData {
       public:
         OutData(std::shared_ptr<OutMessage> out_header_, std::shared_ptr<OutMessage> out_message_,
-                std::function<void(const error_code)> &&callback_) noexcept
-            : out_header(std::move(out_header_)), out_message(std::move(out_message_)), callback(std::move(callback_)) {}
+                std::function<void(const error_code)> &&callback_, bool replaceable_) noexcept
+            : out_header(std::move(out_header_)), out_message(std::move(out_message_)), callback(std::move(callback_)), replaceable(replaceable_) {}
         std::shared_ptr<OutMessage> out_header;
         std::shared_ptr<OutMessage> out_message;
         std::function<void(const error_code)> callback;
+        bool replaceable;
       };
 
       Mutex send_queue_mutex;
@@ -230,9 +231,78 @@ namespace SimpleWeb {
           out_header->put(static_cast<char>(length));
 
         LockGuard lock(send_queue_mutex);
-        send_queue.emplace_back(std::move(out_header), std::move(out_message), std::move(callback));
+
+        // Reliable messages must not be delayed behind a stale replaceable frame.
+        // The first queue item is already in flight and cannot be reordered.
+        auto insert_pos = send_queue.end();
+        if(!send_queue.empty()) {
+          auto it = send_queue.begin();
+          ++it;
+          for(; it != send_queue.end(); ++it) {
+            if(it->replaceable) {
+              insert_pos = it;
+              break;
+            }
+          }
+        }
+
+        send_queue.emplace(insert_pos, std::move(out_header), std::move(out_message), std::move(callback), false);
         if(send_queue.size() == 1)
           send_from_queue();
+      }
+
+      /// Queue a replaceable real-time message.
+      /// At most one replaceable message is kept pending behind the item currently in flight.
+      /// Newer replaceable data supersedes older pending replaceable data, while reliable
+      /// messages retain their order and are always sent first.
+      void send_latest(std::shared_ptr<OutMessage> out_message, unsigned char fin_rsv_opcode = 129) {
+        std::size_t length = out_message->size();
+
+        auto out_header = std::make_shared<OutMessage>(10); // Header is at most 10 bytes
+
+        out_header->put(static_cast<char>(fin_rsv_opcode));
+        if(length >= 126) {
+          std::size_t num_bytes;
+          if(length > 0xffff) {
+            num_bytes = 8;
+            out_header->put(127);
+          }
+          else {
+            num_bytes = 2;
+            out_header->put(126);
+          }
+
+          for(std::size_t c = num_bytes - 1; c != static_cast<std::size_t>(-1); c--)
+            out_header->put((static_cast<unsigned long long>(length) >> (8 * c)) % 256);
+        }
+        else
+          out_header->put(static_cast<char>(length));
+
+        LockGuard lock(send_queue_mutex);
+
+        // Never touch the first item: it may already be referenced by async_write.
+        // Remove only older pending replaceable frames.
+        if(!send_queue.empty()) {
+          auto it = send_queue.begin();
+          ++it;
+          while(it != send_queue.end()) {
+            if(it->replaceable)
+              it = send_queue.erase(it);
+            else
+              ++it;
+          }
+        }
+
+        send_queue.emplace_back(std::move(out_header), std::move(out_message), std::function<void(const error_code)>(), true);
+        if(send_queue.size() == 1)
+          send_from_queue();
+      }
+
+      /// Convenience function for sending the latest replaceable string.
+      void send_latest(std::string_view out_message_str, unsigned char fin_rsv_opcode = 129) {
+        auto out_message = std::make_shared<OutMessage>();
+        out_message->write(out_message_str.data(), static_cast<std::streamsize>(out_message_str.size()));
+        send_latest(std::move(out_message), fin_rsv_opcode);
       }
 
       /// Convenience function for sending a string.
