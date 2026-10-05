@@ -49,6 +49,7 @@ public:
 
 	/// Send replaceable real-time data to one client. If the socket is slower than
 	/// the producer, only the newest pending latest-only message is retained.
+	/// All latest-only sends for a connection share that single pending slot.
 	/// Regular send/sendTo messages remain reliable and ordered.
 	virtual void sendLatestTo(const juce::String& message, const juce::String& id) {}
 	virtual void sendLatestTo(const juce::MemoryBlock& data, const juce::String& id) {}
