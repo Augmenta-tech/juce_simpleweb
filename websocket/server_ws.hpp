@@ -5,6 +5,7 @@
 //#include "../common/crypto.hpp"
 #include "../common/mutex.hpp"
 #include "../common/utility.hpp"
+#include "send_queue.hpp"
 #include <array>
 #include <atomic>
 #include <iostream>
@@ -112,6 +113,12 @@ namespace SimpleWeb {
       asio::ip::tcp::endpoint endpoint; // The endpoint is read in SocketServer::write_handshake and must be stored so that it can be read reliably in all handlers, including on_error
 
       void close() noexcept {
+        {
+          LockGuard lock(send_queue_mutex);
+          if(!send_error)
+            send_error = error::operation_aborted;
+          send_queue.stop();
+        }
         error_code ec;
         socket->lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
         socket->lowest_layer().cancel(ec);
@@ -158,145 +165,135 @@ namespace SimpleWeb {
         std::shared_ptr<OutMessage> out_message;
         std::function<void(const error_code)> callback;
         bool replaceable;
+        std::size_t size() const noexcept {
+          const auto header_size = out_header->size();
+          const auto payload_size = out_message->size();
+          const auto maximum = (std::numeric_limits<std::size_t>::max)();
+          return payload_size > maximum - header_size ? maximum : payload_size + header_size;
+        }
       };
 
       Mutex send_queue_mutex;
-      std::list<OutData> send_queue GUARDED_BY(send_queue_mutex);
+      SendQueue<OutData> send_queue GUARDED_BY(send_queue_mutex);
+      error_code send_error GUARDED_BY(send_queue_mutex);
 
-      /// send_queue_mutex must be locked here
+      /// send_queue_mutex must be locked here. Only one write is ever in flight.
       void send_from_queue() REQUIRES(send_queue_mutex) {
-        std::array<asio::const_buffer, 2> buffers{send_queue.begin()->out_header->streambuf.data(), send_queue.begin()->out_message->streambuf.data()};
+        auto &front = send_queue.front();
+        std::array<asio::const_buffer, 2> buffers{front.out_header->streambuf.data(), front.out_message->streambuf.data()};
         auto self = this->shared_from_this();
         set_timeout();
         asio::async_write(*socket, buffers, [self](const error_code &ec, std::size_t /*bytes_transferred*/) {
-          self->set_timeout(); // Set timeout for next send
-          auto lock = self->handler_runner->continue_lock();
-          if(!lock)
+          auto runner_lock = self->handler_runner->continue_lock();
+          LockGuard lock(self->send_queue_mutex);
+          if(!runner_lock) {
+            // async_write is complete, so its backing buffers can now be freed.
+            self->send_queue.stop();
+            auto abandoned = self->send_queue.take_all();
+            lock.unlock();
             return;
-          {
-            LockGuard _lock(self->send_queue_mutex);
-            if(!ec) {
-              auto it = self->send_queue.begin();
-              auto callback = std::move(it->callback);
-              self->send_queue.erase(it);
-              if(self->send_queue.size() > 0)
-                self->send_from_queue();
-
-              _lock.unlock();
-              if(callback)
-                callback(ec);
-            }
-            else {
-              // All handlers in the queue is called with ec:
-              std::vector<std::function<void(const error_code &)>> callbacks;
-              for(auto &out_data : self->send_queue) {
-                if(out_data.callback)
-                  callbacks.emplace_back(std::move(out_data.callback));
-              }
-              self->send_queue.clear();
-
-              _lock.unlock();
-              for(auto &callback : callbacks)
-                callback(ec);
+          }
+          if(ec && !self->send_error)
+            self->send_error = ec;
+          const auto result = self->send_error;
+          if(!result) {
+            self->set_timeout();
+            auto callback = std::move(self->send_queue.front().callback);
+            self->send_queue.pop_front();
+            if(!self->send_queue.empty())
+              self->send_from_queue();
+            lock.unlock();
+            if(callback)
+              callback(result);
+          }
+          else {
+            self->send_queue.stop();
+            auto failed = self->send_queue.take_all();
+            lock.unlock();
+            // Wake the read handler too, so endpoint/connectionMap cleanup runs.
+            self->close();
+            for(auto &message : failed) {
+              if(message.callback)
+                message.callback(result);
             }
           }
         });
       }
 
-    public:
-      /// fin_rsv_opcode: 129=one fragment, text, 130=one fragment, binary, 136=close connection.
-      /// See http://tools.ietf.org/html/rfc6455#section-5.2 for more information.
-      void send(std::shared_ptr<OutMessage> out_message, std::function<void(const error_code &)> callback = nullptr, unsigned char fin_rsv_opcode = 129) {
-        std::size_t length = out_message->size();
-
-        auto out_header = std::make_shared<OutMessage>(10); // Header is at most 10 bytes
-
+      void enqueue(std::shared_ptr<OutMessage> out_message,
+                   std::function<void(const error_code &)> callback,
+                   unsigned char fin_rsv_opcode, bool replaceable) {
+        const auto length = out_message->size();
+        auto out_header = std::make_shared<OutMessage>(10);
         out_header->put(static_cast<char>(fin_rsv_opcode));
-        // Unmasked (first length byte<128)
         if(length >= 126) {
-          std::size_t num_bytes;
-          if(length > 0xffff) {
-            num_bytes = 8;
-            out_header->put(127);
-          }
-          else {
-            num_bytes = 2;
-            out_header->put(126);
-          }
-
-          for(std::size_t c = num_bytes - 1; c != static_cast<std::size_t>(-1); c--)
-            out_header->put((static_cast<unsigned long long>(length) >> (8 * c)) % 256);
+          const std::size_t num_bytes = length > 0xffff ? 8 : 2;
+          out_header->put(num_bytes == 8 ? 127 : 126);
+          for(std::size_t c = num_bytes; c > 0; --c)
+            out_header->put((static_cast<unsigned long long>(length) >> (8 * (c - 1))) % 256);
         }
         else
           out_header->put(static_cast<char>(length));
 
         LockGuard lock(send_queue_mutex);
-
-        // Queue invariant: the first item may already be in flight, followed by
-        // reliable messages and at most one replaceable real-time message.
-        // A reliable message makes any older pending real-time snapshot stale.
-        if(!send_queue.empty()) {
-          auto it = send_queue.begin();
-          ++it;
-          while(it != send_queue.end()) {
-            if(it->replaceable)
-              it = send_queue.erase(it);
-            else
-              ++it;
-          }
+        // Keep a callback copy for rejection; accepted callbacks live in the queue.
+        const auto result = send_queue.push(OutData(std::move(out_header), std::move(out_message),
+                                                    std::function<void(const error_code)>(callback), replaceable));
+        if(result == SendQueue<OutData>::Result::accepted) {
+          if(send_queue.size() == 1)
+            send_from_queue();
+          return;
         }
+        if(!send_error)
+          send_error = result == SendQueue<OutData>::Result::overflow
+                           ? make_error_code::make_error_code(errc::no_buffer_space)
+                           : error_code(error::operation_aborted);
+        const auto failure = send_error;
+        const auto stats = send_queue.stats();
+        lock.unlock();
 
-        send_queue.emplace_back(std::move(out_header), std::move(out_message), std::move(callback), false);
-        if(send_queue.size() == 1)
-          send_from_queue();
+        if(result == SendQueue<OutData>::Result::overflow) {
+          std::cerr << "WebSocket send queue limit exceeded for " << endpoint
+                    << ": queued_bytes=" << stats.bytes << " queued_messages=" << stats.messages
+                    << " rejected_payload_bytes=" << length << "; disconnecting client" << std::endl;
+          // Post only once per failed connection, never once per produced frame.
+          // Do not queue a close frame behind a socket that has stopped draining.
+          auto self = this->shared_from_this();
+#if(USE_STANDALONE_ASIO && ASIO_VERSION >= 101300) || BOOST_ASIO_VERSION >= 101300
+          asio::post(socket->get_executor(), [self] { self->close(); });
+#else
+          socket->get_io_service().post([self] { self->close(); });
+#endif
+        }
+        // Rejection is synchronous, outside the mutex, so callbacks may re-enter.
+        if(callback)
+          callback(failure);
       }
 
-      /// Queue a replaceable real-time message.
-      /// At most one replaceable message is kept pending behind the item currently in flight.
-      /// All send_latest calls on this connection share that one replaceable slot.
-      /// Newer replaceable data supersedes older pending replaceable data, while reliable
-      /// messages retain their order and are always sent first.
-      void send_latest(std::shared_ptr<OutMessage> out_message, unsigned char fin_rsv_opcode = 129) {
-        std::size_t length = out_message->size();
-
-        auto out_header = std::make_shared<OutMessage>(10); // Header is at most 10 bytes
-
-        out_header->put(static_cast<char>(fin_rsv_opcode));
-        if(length >= 126) {
-          std::size_t num_bytes;
-          if(length > 0xffff) {
-            num_bytes = 8;
-            out_header->put(127);
-          }
-          else {
-            num_bytes = 2;
-            out_header->put(126);
-          }
-
-          for(std::size_t c = num_bytes - 1; c != static_cast<std::size_t>(-1); c--)
-            out_header->put((static_cast<unsigned long long>(length) >> (8 * c)) % 256);
-        }
-        else
-          out_header->put(static_cast<char>(length));
-
+    public:
+      using SendQueueStats = typename SendQueue<OutData>::Stats;
+      SendQueueStats get_send_queue_stats() {
         LockGuard lock(send_queue_mutex);
+        return send_queue.stats();
+      }
 
-        // Never touch the first item: it may already be referenced by async_write.
-        // Remove only older pending replaceable frames.
-        if(!send_queue.empty()) {
-          auto it = send_queue.begin();
-          ++it;
-          while(it != send_queue.end()) {
-            if(it->replaceable)
-              it = send_queue.erase(it);
-            else
-              ++it;
-          }
-        }
+      error_code get_send_error() {
+        LockGuard lock(send_queue_mutex);
+        return send_error;
+      }
 
-        send_queue.emplace_back(std::move(out_header), std::move(out_message), std::function<void(const error_code)>(), true);
-        if(send_queue.size() == 1)
-          send_from_queue();
+      /// Reliable and ordered while connected, with finite per-client limits.
+      /// On overload, reject the send and disconnect instead of dropping events.
+      /// A rejected send's callback can run synchronously, outside all queue locks.
+      /// fin_rsv_opcode: 129=text, 130=binary, 136=close.
+      void send(std::shared_ptr<OutMessage> out_message, std::function<void(const error_code &)> callback = nullptr, unsigned char fin_rsv_opcode = 129) {
+        enqueue(std::move(out_message), std::move(callback), fin_rsv_opcode, false);
+      }
+
+      /// One in-flight message plus at most one pending replaceable snapshot.
+      /// Reliable messages share the same byte/message budget and retain order.
+      void send_latest(std::shared_ptr<OutMessage> out_message, unsigned char fin_rsv_opcode = 129) {
+        enqueue(std::move(out_message), nullptr, fin_rsv_opcode, true);
       }
 
       /// Convenience function for sending the latest replaceable string.
@@ -406,6 +403,12 @@ namespace SimpleWeb {
       long timeout_request = 5;
       /// Idle timeout. Defaults to no timeout.
       long timeout_idle = 0;
+      /// Per-connection outbound limits, including the in-flight frame and headers.
+      /// Applies to reliable, latest-only, poll responses and control messages.
+      /// Exceeding either limit disconnects that client with no_buffer_space.
+      /// Zero rejects all outbound messages; it does not mean unlimited.
+      std::size_t max_send_queue_bytes = SendQueue<int>::default_max_bytes;
+      std::size_t max_send_queue_messages = SendQueue<int>::default_max_messages;
       /// Maximum size of incoming messages. Defaults to architecture maximum.
       /// Exceeding this limit will result in a message_size error code and the connection will be closed.
       std::size_t max_message_size = (std::numeric_limits<std::size_t>::max)();
@@ -613,6 +616,8 @@ namespace SimpleWeb {
     }
 
     void write_handshake(const std::shared_ptr<Connection> &connection) {
+      // Shared by WS, WSS and externally upgraded HTTP sockets, before on_open.
+      connection->send_queue.set_limits(config.max_send_queue_bytes, config.max_send_queue_messages);
       for(auto &regex_endpoint : endpoint) {
         regex::smatch path_match;
         if(regex::regex_match(connection->path, path_match, regex_endpoint.first)) {
@@ -886,8 +891,10 @@ namespace SimpleWeb {
         endpoint.connections.erase(connection);
       }
 
-      if(endpoint.on_error)
-        endpoint.on_error(connection, ec);
+      if(endpoint.on_error) {
+        const auto send_error = connection->get_send_error();
+        endpoint.on_error(connection, send_error ? send_error : ec);
+      }
     }
   };
 
