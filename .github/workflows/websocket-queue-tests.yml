@@ -1,0 +1,32 @@
+name: WebSocket queue regression tests
+on:
+  push:
+    branches: [fix/bounded-realtime-send-queue]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  queue-and-transport:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install transport test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev libssl-dev
+      - name: Queue policy regression tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -O2 tests/send_queue_test.cpp -o /tmp/send_queue_test
+          /tmp/send_queue_test
+      - name: Queue policy ASan and UBSan
+        run: |
+          g++ -std=c++17 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer tests/send_queue_test.cpp -o /tmp/send_queue_test_asan
+          ASAN_OPTIONS=detect_leaks=1 /tmp/send_queue_test_asan
+      - name: Real WS transport and TLS template compile
+        run: |
+          g++ -std=c++17 -pthread -g -O1 -Wall -Wextra -Wno-unknown-pragmas -include string -include cstdint -include cstring tests/websocket_transport_test.cpp common/WSCrypto.cpp -lssl -lcrypto -o /tmp/websocket_transport_test
+          timeout 30s /tmp/websocket_transport_test
+      - name: Transport ASan and UBSan
+        run: |
+          g++ -std=c++17 -pthread -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -include string -include cstdint -include cstring tests/websocket_transport_test.cpp common/WSCrypto.cpp -lssl -lcrypto -o /tmp/websocket_transport_test_asan
+          ASAN_OPTIONS=detect_leaks=1 timeout 30s /tmp/websocket_transport_test_asan
