@@ -43,11 +43,23 @@ struct Fixture {
     server.upgrade(connection); // Exercise the path used by the JUCE HTTP wrapper.
     return connection;
   }
-  void run() {
-    io->restart();
-    io->run_for(std::chrono::milliseconds(150));
+  template <typename Predicate>
+  void run_until(Predicate done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while(!done()) {
+      if(std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("Timed out waiting for WebSocket completion");
+      io->restart();
+      io->run_for(std::chrono::milliseconds(10));
+    }
   }
   ~Fixture() {
+    // Do not invoke application callbacks after their captured locals expire.
+    for(auto &entry : server.endpoint) {
+      entry.second.on_open = nullptr;
+      entry.second.on_error = nullptr;
+      entry.second.on_close = nullptr;
+    }
     for(auto &peer : peers) {
       Error ignored;
       peer->close(ignored);
@@ -74,7 +86,9 @@ int main() {
         CHECK(stats.replaced == 9998 && !stats.stopped);
       };
       auto connection = f.connect("/latest");
-      f.run();
+      // The producer loop itself can exceed 150 ms under ASan. Wait for the
+      // completion handlers too, rather than assuming a fixed run_for drained it.
+      f.run_until([&] { return opened && connection->get_send_queue_stats().bytes == 0; });
       CHECK(opened);
       CHECK(connection->get_send_queue_stats().bytes == 0);
     }
@@ -89,7 +103,7 @@ int main() {
         auto callback = [&](const Error &ec) { CHECK(ec == overflow); ++callbacks; };
         connection->send(std::string(60, 'a'), callback); // 62 bytes in flight.
         connection->send(std::string(60, 'b'), callback); // Reject instead of exceeding 100.
-        connection->send("again", [&](const Error &ec) {
+        connection->send("again", [&, connection](const Error &ec) {
           CHECK(ec == overflow);
           ++callbacks;
           // This must not deadlock by invoking callbacks under send_queue_mutex.
@@ -108,7 +122,10 @@ int main() {
       };
       auto overloaded = f.connect("/slow");
       auto good = f.connect("/healthy");
-      f.run();
+      f.run_until([&] {
+        return callbacks == 3 && nested == 1 && errors == 1 && healthy_sent
+            && overloaded->get_send_queue_stats().bytes == 0;
+      });
       CHECK(callbacks == 3 && nested == 1 && errors == 1);
       CHECK(healthy_sent && !good->get_send_queue_stats().stopped);
       CHECK(overloaded->get_send_queue_stats().bytes == 0);
